@@ -16,7 +16,7 @@ The premise is that you'd like to write functions with signatures like this:
     g : B ->{Store G, Stream C, Foo} ()
 ```
 
-You then use this library to compose and run these functions, by first transforming them into the corresponding _port functions_:
+You then use this library to compose and run these _stream functions_, by first transforming them into the corresponding _port functions_:
 
 ```haskell
     -- Take a B port (a consumer of Bs) and transform it into an A port (a
@@ -29,12 +29,12 @@ You then use this library to compose and run these functions, by first transform
     g_ports : Port C s g -> Port B (Tuple G s) {g, Foo}
 ```
 
-These functions compose directly: `f_ports . g_ports : Port C s g -> Port A (Tuple G s) {g, Foo}`.
+These functions compose directly: `f_ports . g_ports : Port C s g -> Port A (Tuple G s) {g, Foo}`.  This corresponds to wiring up `g` to process the stream of `B`s coming out of `f`.
 
 Once you've finished composing the functions, you can run the result like this:
 
 ```haskell
--- see @example2.main in the repo for a runnable example, similar to this one
+-- see example2.main in the repo for a runnable example, similar to this one
 main : A -> G ->{Foo} [C]
 main a g =
   go = 'let
@@ -60,7 +60,7 @@ It kinda works, but I wouldn't recommend you build anything on it just yet: ther
 
 There's awkwardness if you want to write a function `A ->{Stream B, Stream C} ()` - Unison doesn't support functions that require two abilities with the same head type constructor, `Stream B` and `Stream C` in this case.  Currently it will accept the type signature, but choke when you try and call the ability's operator (`emit`), because it can't work out which of the two abilities you mean (even despite the argument type giving a good clue.)  I hope this works in some future version of Unison...  For now the workaround is to define a specialized version of `Stream`: `ability StreamB where emitB : B -> ()`, plus a few similarly specialized supporting functions.  Irritating, but not actually a deal-breaker.
 
-`ports` isn't really the same as actors - for example, while an actor can create another actor and send a message to it, a port function can't dynamically change the graph of port functions being run in the same way.  My suspicion is that that is a Good Thing: we jettison some dynamic reconfiguration stuff which can't be made statically type-safe, but we're left still with the important essence of the actor model, namely messages flowing through a graph of stateful processors.
+`ports` isn't really the same as the actor model - for example, while an actor can create another actor and send a message to it, a port function can't dynamically change the graph of port functions being run in the same way.  An actor also has its own lifetime, whereas a port function doesn't.  My suspicion is that we're still left at a useful point in the design space, and we've kept an interesting part of the essence of the actor model, namely messages flowing through a graph of stateful processors.
 
 The ports transformation (where we went from `f` to `f_ports`) feels like it touches on something fundamental.  Given a signature `A ->{Stream B, Stream C, Stream D} ()`, we see that actually it corresponds exactly with `P D -> P C -> P B -> P A` (writing `P x` for `Port x s g`).  We've moved the focus from 'functions that emit stuff' to 'functions that consume stuff', and we've flipped the direction of the function arrow.  (Maybe this is where people talk about 'codata'?  LMK if you have insights as to what's going on...)
 
@@ -68,14 +68,8 @@ Adding in state means that as you compose port functions, you also need to compo
 
 Overall I'm bullish on this general idea, with the following reservations:
 - I can't yet explain how it relates to the various sophisticated functional streaming libraries that are out there (e.g. [fs2](https://fs2.io/))
-  - All I can say right now is that streams libraries seem to focus on mapping/filtering or otherwise transforming the streams of data; whereas with `ports` the focus is on the stateful processors and how they act on each new input - the streams of data flowing between them are not themselves first-class things to be manipulated.
+  - Streams libraries seem to focus on mapping/filtering or otherwise transforming the streams of data; whereas with `ports` the focus is on the stateful processors and how they act on each new input - the streams of data flowing between them are not themselves first-class things to be manipulated.
 - I fear that all the lensed access to state might be slow.
-
-## Design
-
-TODO (including example of a port transformation)
-
-(In the meantime take a look at the docs in the repo for `Port`, `Run`, `Runtime.run`.)
 
 ## Future directions
 
@@ -89,6 +83,127 @@ Here are some things it would be cool to investigate further.
 - Seeing whether there maybe could actually be some analogue to dynamically creating an actor.
 - Working up some effectful 'injector' port functions, e.g. injecting data received from a socket.
 - Deciding how to model 'wake me up in x milliseconds'.
+
+## Design
+
+### `Port` and `Run`
+The key definitions are the `Port` type and the `Run` ability:
+
+```haskell
+-- This is a wrapper for a function that is a 'consumer of a values'.
+unique type Port a s g
+  = Port (a ->{Run s g, g} ())
+
+-- This ability is a combination of `Store s`, giving access to state, plus an `enqueue`
+-- operation which allows further computations to be scheduled for later processing.
+ability Run s g where
+  put : s ->{Run s g} ()
+  get : {Run s g} s
+  enqueue : '{g, Run s g} () ->{Run s g} ()
+```
+
+### Ports transformation example
+The `Run` ability is constructed to let us make the ports transformation - let's see how that works.  Let's take the example of transforming from this
+
+```haskell
+g : B ->{Store G, Stream C, Foo} ()
+```
+
+to this:
+
+```haskell
+g_ports : Port C s g -> Port B (Tuple G s) {g, Foo}
+```
+
+We need to wrap `g` with some handlers that deal with the `Store G` and `Stream C` abilities.  First we handle the `Stream C` ability by taking each `Stream.emit c` call that `f` makes, and mapping it through to a call to `Run.enqueue`.  To do this, we need to know what port is going to receive the `c` value.  The library provides the following function, which does the job of converting `Stream` to `Run`.
+
+```haskell
+consumeStream : Port a s g -> (x ->{h, Stream a} y) -> x ->{h, Run s g} y
+```
+
+Then we need to map `Store` to `Run`.  The interesting point here is that the port that `g_ports` is creating needs to have access not just to the state `G`, but also whatever state is used by the `Port C s g` that will consume `g`'s output stream of `C`s.  So while `g` just uses `Store G`, the port we're building has state `Tuple G s`.  The library provides the following function for this conversion.
+
+```haskell
+-- in this example o is (Tuple G s), a is G, b is s
+addState : Lens o a -> Lens o b -> (x ->{h, Store a, Run b g} y) -> x ->{h, Run o g} y
+```
+
+Suppose we name our lenses as follows:
+
+```haskell
+Tuple.lens_a : Lens (Tuple a b) a
+Tuple.lens_b : Lens (Tuple a b) b
+```
+
+Then the incantation to do the full ports transformation ends up being:
+
+```haskell
+g_ports : Port C s g -> Port B (Tuple G s) {g, Foo}
+g_ports p =
+  transform = Port . (addState lens_a lens_b . consumeStream p)
+  transform g
+```
+
+The implementation of `g_ports` is mechanically derivable from the type - maybe it could be automatic if Unison adds metaprogramming support.
+
+### Runtime
+
+So far, all we've done is wrapped and transformed our stream functions (`f`/`g`) into ports functions (`f_ports`/`g_ports`) which compose in a more pluggable fashion.  Let's look at how to actually run them.
+
+```haskell
+unique type Runtime.State s g
+  = Runtime.State ['{Run s g, g} ()] s
+
+Port.inject : Port a s g -> a ->{g, Store (Runtime.State s g)} ()
+
+Runtime.run : '{g, Store (Runtime.State s g)} ()
+
+Runtime.handler : s -> Request (Store (Runtime.State s g)) v -> v
+```
+
+`Runtime.run` is a scheduler which dispatches work tracked by `Runtime.State` until there's none left.  The runtime state, which it acts on, is just a queue of functions to be run.  There are two ways that things get on that queue:
+
+1) by being injected 'from outside', usually with a call to `Port.inject`
+
+2) by port functions calling `Run.enqueue` when they are dispatched - i.e. the underlying stream functions emitting values on their output streams.
+
+So to actually make something happen, the steps are:
+
+1) write a function that injects some work and calls `Runtime.run` - that function is in ability `{Store (Runtime.State s g)}`
+
+2) handle that function with `Runtime.handler`.
+
+The only conundrum left is how to actually see some kind of result from all this.  For this example we're going to supply the following as our `Port C s g` - the thing that actually consumes the `C` produced at the end of the chain.
+
+```haskell
+streamer : Port a () {Stream a}
+streamer = Port emit
+```
+
+After all the work we've done to eliminate and handle all the `Stream` abilities in `f` and `g`, we're now going to go the other way and resurface our `C` outputs back as a `Stream C`.
+
+Let's see the example again, and look how it fits together:
+
+```haskell
+-- see example2.main in the repo for a runnable example, similar to this one
+main : A -> G ->{Foo} [C]
+main a g =
+  go = 'let
+    system = f_ports . g_ports
+    port : Port A (Tuple G ()) {Stream C, Foo}
+    port = system streamer
+    Port.inject port <| a
+    !Runtime.run
+  Stream.toList '(handle !go with Runtime.handler (Cons g ()))
+```
+
+- `system` is our composed port function, of type `Port C s g -> Port A (Tuple G s) {g, Foo}`
+- `streamer` is our `Port C () {Stream C}` which we pass to `system`, to yield the `A` port, of type `Port A (Tuple G ()) {Stream C, Foo}`
+- We use `Port.inject` to put (a port-transformed version of) `f a` onto our runtime scheduler queue
+- We call `Runtime.run` to turn the handle and see what happens.
+- All this give us a function `go : '{Store (Runtime.State (Tuple G ()) {Stream C, Foo}), Stream C, Foo} ()`.
+- We handle that runtime `Store` ability with `Runtime.handler`, passing in `Cons g ()` as the initial `Tuple G ()` state.
+- And then we collect the `Stream C` into a list.
 
 ## Repo contents
 
