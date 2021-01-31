@@ -2,16 +2,17 @@
 
 _ports_ is an experimental [Unison](https://unisonweb.org) library for composing stateful message-processing functions.
 
-> Get the code from ucm with `pull https://github.com/atacratic/ports:.trunk .ports`
+> Get the code in ucm with `pull https://github.com/atacratic/ports:.trunk .ports`
 
 The premise is that you'd like to write functions with signatures like this:
 
 ```haskell
-    -- Take an A, and emit zero or more Bs
+    -- Take an A, and emit zero or more Bs.
+    -- We'll often think of A as an input message, and B as an output message.
     f : A ->{Stream B} ()
 
     -- Take a B, process it with the help of some state G, and emit zero or
-    -- more Cs (using ability Foo as we go)
+    -- more Cs (using ability Foo as we go).
     g : B ->{Store G, Stream C, Foo} ()
 ```
 
@@ -23,8 +24,8 @@ You then use this library to compose and run these functions, by first transform
     -- then the A port has the same.
     f_ports : Port B s g -> Port A s g
 
-    -- Take a C port and produce a B port, which has extra state (G) and
-    -- ability (Foo).
+    -- Take a C port and produce a B port, which has extra state G and
+    -- uses an extra ability Foo.
     g_ports : Port C s g -> Port B (Tuple G s) {g, Foo}
 ```
 
@@ -45,9 +46,51 @@ main a g =
   Stream.toList '(handle !go with Runtime.handler (Cons g ()))
 ```
 
-`Runtime.run` is a scheduler, which is taking all the emitted values and dispatching them into the next function along.
+`Runtime.run` is a scheduler, which takes all the emitted values and dispatches them into the next function along.
 
-### Repo contents
+## Motivation
+
+I wanted to write this to explore the possibilities for [actor](https://en.wikipedia.org/wiki/Actor_model)-style programming in Unison, but under the constraint that the 'actors' be composable according to their types.  I'm excited that Unison's ability types can express the necessary stuff so directly.
+
+I also wanted to see if I could get a work scheduler of some description to pass the Unison typechecker.  Unison doesn't have any escape hatches (no `unsafeCoerce`) - or at least, not yet - and it wasn't obvious to me how to write a scheduler without that.
+
+## Assessment and learnings
+
+It kinda works, but I wouldn't recommend you build anything on it just yet: there are some typechecker bugs which make it pretty painful - lots of bouncing between spurious ability check errors and infinite loops during type inference.  See [unison#1790](https://github.com/unisonweb/unison/issues/1790) and [unison#1791](https://github.com/unisonweb/unison/issues/1791).  `ports` makes lots of use of ability signatures that look like `{g, Run s g}`, where the same ability variable `g` appears both as a member of the ability list and as a parameter of another member; I think it's this that Unison is sometimes choking on.  At the time of writing ability typechecking is getting some TLC, and this related issue is under investigation [unison#1792](https://github.com/unisonweb/unison/issues/1792) so things will likely improve.  They probably will need to: the new proposed distributed programming API ([here](https://github.com/unisonweb/distributed/issues/1)) includes similar-looking signatures.  For now, the impact is that getting Unison to accept functions like `main` above requires some awkward contortions - see `example2.main.doc` in the repo for an explanation.
+
+There's awkwardness if you want to write a function `A ->{Stream B, Stream C} ()` - Unison doesn't support functions that require two abilities with the same head type constructor, `Stream B` and `Stream C` in this case.  Currently it will accept the type signature, but choke when you try and call the ability's operator (`emit`), because it can't work out which of the two abilities you mean (even despite the argument type giving a good clue.)  I hope this works in some future version of Unison...  For now the workaround is to define a specialized version of `Stream`: `ability StreamB where emitB : B -> ()`, plus a few similarly specialized supporting functions.  Irritating, but not actually a deal-breaker.
+
+`ports` isn't really the same as actors - for example, while an actor can create another actor and send a message to it, a port function can't dynamically change the graph of port functions being run in the same way.  My suspicion is that that is a Good Thing: we jettison some dynamic reconfiguration stuff which can't be made statically type-safe, but we're left still with the important essence of the actor model, namely messages flowing through a graph of stateful processors.
+
+The ports transformation (where we went from `f` to `f_ports`) feels like it touches on something fundamental.  Given a signature `A ->{Stream B, Stream C, Stream D} ()`, we see that actually it corresponds exactly with `P D -> P C -> P B -> P A` (writing `P x` for `Port x s g`).  We've moved the focus from 'functions that emit stuff' to 'functions that consume stuff', and we've flipped the direction of the function arrow.  (Maybe this is where people talk about 'codata'?  LMK if you have insights as to what's going on...)
+
+Adding in state means that as you compose port functions, you also need to compose the type of their state.  So the ports transformation needs to explain how (for example) a `Port A (F, G) g` can crack the `F` and the `G` out of the overall state, and pass them separately to the constituent ports functions.  This is achieved with some lenses that you need to provide as you make the port transformation.  I tried for a while to avoid specifying the state type as an argument to `Port` - but then the scheduler doesn't typecheck, as it can't summon up the relevant state at the right type.
+
+Overall I'm bullish on this general idea, with the following reservations:
+- I can't yet explain how it relates to the various sophisticated functional streaming libraries that are out there (e.g. [fs2](https://fs2.io/))
+  - All I can say right now is that streams libraries seem to focus on mapping/filtering or otherwise transforming the streams of data; whereas with `ports` the focus is on the stateful processors and how they act on each new input - the streams of data flowing between them are not themselves first-class things to be manipulated.
+- I fear that all the lensed access to state might be slow.
+
+## Design
+
+TODO (including example of a port transformation)
+
+(In the meantime take a look at the docs in the repo for `Port`, `Run`, `Runtime.run`.)
+
+## Future directions
+
+Here are some things it would be cool to investigate further.
+
+- Demonstrating that you can have a port function wired up to send back into itself.  (You can; I just need to work up the example code again.)
+- Scaling up to slightly larger example systems.
+- Seeing what a request/response pattern ends up looking like.  How much wiring do you end up needing to do?
+- Seeing how to group sets of port functions that all want access to the same state (~ 'actors that can receive multiple message types').
+- Investigating analogues to the supervision trees found in actor systems.
+- Seeing whether there maybe could actually be some analogue to dynamically creating an actor.
+- Working up some effectful 'injector' port functions, e.g. injecting data received from a socket.
+- Deciding how to model 'wake me up in x milliseconds'.
+
+## Repo contents
 
 Here's what you see when you pull:
 
