@@ -2,6 +2,8 @@
 
 _ports_ is an experimental [Unison](https://unisonweb.org) library for composing stateful message-processing functions.
 
+I wanted to write this to explore the possibilities for [actor](https://en.wikipedia.org/wiki/Actor_model)-style programming in Unison, but under the constraint that the 'actors' be composable according to their types.
+
 > Get the code in ucm with `pull https://github.com/atacratic/ports:.trunk .ports`
 
 The premise is that you'd like to write functions with signatures like this:
@@ -31,10 +33,11 @@ You then use this library to compose and run these _stream functions_, by first 
 
 These functions compose directly: `f_ports . g_ports : Port C s g -> Port A (Tuple G s) {g, Foo}`.  This corresponds to wiring up `g` to process the stream of `B`s coming out of `f`.
 
-Once you've finished composing the functions, you can run the result like this:
+Once you've finished composing some port functions, you can run the result like this:
 
 ```haskell
 -- see example2.main in the repo for a runnable example, similar to this one
+-- we walk through this code in the 'design' section below
 main : A -> G ->{Foo} [C]
 main a g =
   go = 'let
@@ -46,13 +49,15 @@ main a g =
   Stream.toList '(handle !go with Runtime.handler (Cons g ()))
 ```
 
-`Runtime.run` is a scheduler, which takes all the emitted values and dispatches them into the next function along.
+`Runtime.run` is a scheduler, which takes all the emitted values and dispatches them into the next function along, repeatedly, until there's nothing left to do.
 
 ## Motivation
 
 I wanted to write this to explore the possibilities for [actor](https://en.wikipedia.org/wiki/Actor_model)-style programming in Unison, but under the constraint that the 'actors' be composable according to their types.  I'm excited that Unison's ability types can express the necessary stuff so directly.
 
 I also wanted to see if I could get a work scheduler of some description to pass the Unison typechecker.  Unison doesn't have any escape hatches (no `unsafeCoerce`) - or at least, not yet - and it wasn't obvious to me how to write a scheduler without that.
+
+I'd like to get reactions and ideas from other people: please hit me up on the Unison [slack](https://www.unisonweb.org/community)!
 
 ## Assessment and learnings
 
@@ -97,9 +102,9 @@ unique type Port a s g
 -- This ability is a combination of `Store s`, giving access to state, plus an `enqueue`
 -- operation which allows further computations to be scheduled for later processing.
 ability Run s g where
-  put : s ->{Run s g} ()
-  get : {Run s g} s
-  enqueue : '{g, Run s g} () ->{Run s g} ()
+  put : s -> ()
+  get : s
+  enqueue : '{g, Run s g} () -> ()
 ```
 
 ### Ports transformation example
@@ -144,13 +149,14 @@ g_ports p =
   transform g
 ```
 
-The implementation of `g_ports` is mechanically derivable from the type - maybe it could be automatic if Unison adds metaprogramming support.
+The implementation of `g_ports` is mechanically derivable from the type - maybe it could be automatic if Unison gets metaprogramming support.
 
 ### Runtime
 
-So far, all we've done is wrapped and transformed our stream functions (`f`/`g`) into ports functions (`f_ports`/`g_ports`) which compose in a more pluggable fashion.  Let's look at how to actually run them.
+So far, all we've done is wrapped and transformed our stream functions (`f`/`g`) into ports functions (`f_ports`/`g_ports`) which compose in a more pluggable fashion.  Let's look at how to actually run them.  The functions we'll use work in the ability `{Store (Runtime.State s g)}`.
 
 ```haskell
+-- The runtime's state is a queue of operations to be dispatched, plus the state s
 unique type Runtime.State s g
   = Runtime.State ['{Run s g, g} ()] s
 
@@ -158,14 +164,15 @@ Port.inject : Port a s g -> a ->{g, Store (Runtime.State s g)} ()
 
 Runtime.run : '{g, Store (Runtime.State s g)} ()
 
+-- s is the initial state
 Runtime.handler : s -> Request (Store (Runtime.State s g)) v -> v
 ```
 
-`Runtime.run` is a scheduler which dispatches work tracked by `Runtime.State` until there's none left.  The runtime state, which it acts on, is just a queue of functions to be run.  There are two ways that things get on that queue:
+`Runtime.run` is a scheduler which dispatches work tracked by `Runtime.State` until there's none left.  The runtime state, which it acts on, contains the queue of functions to be run.  There are two ways that things get on that queue:
 
 1) by being injected 'from outside', usually with a call to `Port.inject`
 
-2) by port functions calling `Run.enqueue` when they are dispatched - i.e. the underlying stream functions emitting values on their output streams.
+2) by port functions calling `Run.enqueue` when they are dispatched - this happens when the underlying stream functions emit values on their output streams.
 
 So to actually make something happen, the steps are:
 
@@ -173,7 +180,9 @@ So to actually make something happen, the steps are:
 
 2) handle that function with `Runtime.handler`.
 
-The only conundrum left is how to actually see some kind of result from all this.  For this example we're going to supply the following as our `Port C s g` - the thing that actually consumes the `C` produced at the end of the chain.
+### Running the system - example
+
+Let's carry on with our running example.  The only conundrum left is how to actually see some kind of result value from all this.  Let's supply the following as our `Port C s g` - the thing that actually consumes the `C` produced at the end of the chain.
 
 ```haskell
 streamer : Port a () {Stream a}
@@ -199,7 +208,7 @@ main a g =
 
 - `system` is our composed port function, of type `Port C s g -> Port A (Tuple G s) {g, Foo}`
 - `streamer` is our `Port C () {Stream C}` which we pass to `system`, to yield the `A` port, of type `Port A (Tuple G ()) {Stream C, Foo}`
-- We use `Port.inject` to put (a port-transformed version of) `f a` onto our runtime scheduler queue
+- We use `Port.inject` to put (a port-transformed version of) `f a` onto our runtime scheduler queue, to kick things off.
 - We call `Runtime.run` to turn the handle and see what happens.
 - All this give us a function `go : '{Store (Runtime.State (Tuple G ()) {Stream C, Foo}), Stream C, Foo} ()`.
 - We handle that runtime `Store` ability with `Runtime.handler`, passing in `Cons g ()` as the initial `Tuple G ()` state.
